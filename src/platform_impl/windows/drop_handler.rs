@@ -94,8 +94,14 @@ impl FileDropHandler {
             })
         };
         drop_handler.hovered_is_valid = hdrop.is_some();
-        drop_handler.cursor_effect =
-            if drop_handler.hovered_is_valid { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+        // Copy only: never the incoming copy/move bitmask, and only when the source allows a
+        // copy (a source that would move its files is never asked to delete them).
+        let copy_allowed = unsafe { *pdwEffect } & DROPEFFECT_COPY != 0;
+        drop_handler.cursor_effect = if drop_handler.hovered_is_valid && copy_allowed {
+            DROPEFFECT_COPY
+        } else {
+            DROPEFFECT_NONE
+        };
         unsafe {
             *pdwEffect = drop_handler.cursor_effect;
         }
@@ -111,7 +117,7 @@ impl FileDropHandler {
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
         unsafe {
-            *pdwEffect = drop_handler.cursor_effect;
+            *pdwEffect = Self::copy_only(drop_handler.cursor_effect, *pdwEffect);
         }
 
         S_OK
@@ -135,10 +141,25 @@ impl FileDropHandler {
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
         _pt: *const POINTL,
-        _pdwEffect: *mut u32,
+        pdwEffect: *mut u32,
     ) -> HRESULT {
-        use crate::event::WindowEvent::DroppedFile;
+        use crate::event::WindowEvent::{DroppedFile, HoveredFileCancelled};
         let drop_handler = unsafe { Self::from_interface(this) };
+        // Accept a copy only: a drop the hover rejected, or whose source no longer allows a
+        // copy, is refused with `DROPEFFECT_NONE` and delivers nothing.
+        let effect = unsafe { Self::copy_only(drop_handler.cursor_effect, *pdwEffect) };
+        unsafe {
+            *pdwEffect = effect;
+        }
+        if effect != DROPEFFECT_COPY {
+            if drop_handler.hovered_is_valid {
+                drop_handler.send_event(Event::WindowEvent {
+                    window_id: RootWindowId(WindowId(drop_handler.window)),
+                    event: HoveredFileCancelled,
+                });
+            }
+            return S_OK;
+        }
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
                 drop_handler.send_event(Event::WindowEvent {
@@ -152,6 +173,16 @@ impl FileDropHandler {
         }
 
         S_OK
+    }
+
+    /// `DROPEFFECT_COPY` when `wanted` is a copy and the source's `allowed` effects include
+    /// one, else `DROPEFFECT_NONE`.
+    fn copy_only(wanted: u32, allowed: u32) -> u32 {
+        if wanted == DROPEFFECT_COPY && allowed & DROPEFFECT_COPY != 0 {
+            DROPEFFECT_COPY
+        } else {
+            DROPEFFECT_NONE
+        }
     }
 
     unsafe fn from_interface<'a, InterfaceT>(this: *mut InterfaceT) -> &'a mut FileDropHandlerData {
